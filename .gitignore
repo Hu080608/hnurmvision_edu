@@ -22,3 +22,11 @@
 
 # Local simulation diagnostics
 /simulation/outputs/
+
+# 第三讲：神经网络产物与数据（不进 git）
+*.pt
+*.engine
+assets/*.onnx
+runs/
+datasets/
+*.cache
