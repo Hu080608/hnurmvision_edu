@@ -1,6 +1,6 @@
 # 只需要修改显示、发射许可和相机标定。
 display: true
-allow_fire: false
+allow_fire: true
 
 # 仿真环境下的相机内参
 camera_matrix: [1303.6753236814714, 0.0, 720.0,

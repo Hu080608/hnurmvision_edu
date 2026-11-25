@@ -6,7 +6,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(hnurm_interfaces REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui calib3d)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui calib3d freetype)
 find_package(Eigen3 REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
