@@ -103,16 +103,33 @@ void IoContext::on_image(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
   }
   last_arrival_ = now;
 
-  latest_image_ = msg;    // 只加引用计数，不复制像素
-  pending_image_ = true;  // 标记有一帧没交给算法
+  {
+    std::lock_guard<std::mutex> lk(data_mu_);
+    latest_image_ = msg;    // 只加引用计数，不复制像素
+    pending_image_ = true;  // 标记有一帧没交给算法
+  }
+  data_cv_.notify_all();    // 唤醒 read()
 }
 
 void IoContext::on_feedback(
     const hnurm_interfaces::msg::VisionRecvData::ConstSharedPtr& msg) {
-  latest_feedback_ = msg;
-  has_work_mode_ = true;
-  work_mode_ = msg->work_mode.data;
-  // work_mode 要取两次
+  {
+    std::lock_guard<std::mutex> lk(data_mu_);
+    latest_feedback_ = msg;
+    has_work_mode_ = true;
+    work_mode_ = msg->work_mode.data;
+  }
+  // 按"收到时刻"存档，供 feedback_at() 插值
+  FeedbackSample s;
+  s.t = Clock::now();
+  s.roll  = static_cast<double>(msg->roll);
+  s.pitch = static_cast<double>(msg->pitch);
+  s.yaw   = static_cast<double>(msg->yaw);
+  s.bullet_speed = static_cast<double>(msg->bullet_speed.data);
+  feedback_hist_.push_back(s);
+  while (!feedback_hist_.empty() &&
+         std::chrono::duration<double>(s.t - feedback_hist_.front().t).count() > 1.0)
+    feedback_hist_.pop_front();
 }
 
 // ---------------------------------------------------------------- 时间
@@ -141,8 +158,12 @@ void IoContext::open() {
   if (opened_) return;
 
   // 1) 自己的 Context，不依赖外部是否调用过 rclcpp::init。
-  context_ = std::make_shared<rclcpp::Context>();
-  context_->init(0, nullptr);
+  // 复用主线程已经 init 过的全局 context（否则会重复初始化 rclcpp 的日志，打印一条 WARN）
+  context_ = rclcpp::contexts::get_global_default_context();
+  if (!context_->is_valid()) {
+    context_ = std::make_shared<rclcpp::Context>();
+    context_->init(0, nullptr);
+  }
 
   // 2) 节点名 training_io，会在 ros2 node list 里看到。
   rclcpp::NodeOptions node_options;
@@ -177,6 +198,8 @@ void IoContext::open() {
   executor_->add_node(node_);   // 把节点注册进去。不注册，订阅再多也不会有回调被执行。
 
   opened_ = true;   // 放在最后。如果中途抛异常，它仍是 false，close() 会安全地什么都不做。
+  run_.store(true);
+  runner_ = std::thread(&IoContext::run_loop, this);      // ★ 执行器常驻线程
   std::printf("[IO] 已连接：订阅 /image_raw、/vision_receive_data，发布 /vision_send_data"
               "（节点 training_io）\n");
   std::fflush(stdout);    // 强制把缓冲区刷出去。重定向到文件时 stdout 是块缓冲，不刷新的话日志会攒一批才出现，排查时看不到实时输出。
@@ -187,30 +210,24 @@ void IoContext::open() {
 std::optional<SensorData> IoContext::read() {
   if (!opened_ || !executor_) return std::nullopt;    // 任一为空就立刻返回 nullopt（没打开就不可能有数据）
 
-  // 阶段一：有界等待，先把已就绪的回调处理掉，再最多等 kReadWaitMs（20ms）
-  const auto deadline = Clock::now() + std::chrono::milliseconds(kReadWaitMs);
-  try {
-    for (;;) {    // 无限循环
-      executor_->spin_some();   // 把此刻已经就绪的回调全部执行掉，不等待
-      if (pending_image_ && latest_image_ && latest_feedback_) break;
-      const auto now = Clock::now();
-      if (now >= deadline) break;
-      executor_->spin_once(deadline - now);   // 最多等这么久，只处理一个就绪回调
+  // 阶段一：等待"新的一帧图像 + 至少一条反馈"。
+  // 注意：这里不再自己 spin 执行器——执行器由 runner_ 线程常驻 spin（见 open()）。
+  // 否则"第二线程发布/计算"会把 image 回调饿死（实测检测线程只跑完 1 帧）。
+  sensor_msgs::msg::Image::ConstSharedPtr image;
+  hnurm_interfaces::msg::VisionRecvData::ConstSharedPtr feedback;
+  {
+    std::unique_lock<std::mutex> lk(data_mu_);
+    const bool ok = data_cv_.wait_for(
+        lk, std::chrono::milliseconds(kReadWaitMs * 3),
+        [this] { return pending_image_ && latest_image_ && latest_feedback_; });
+    if (!ok) {
+      ++null_;
+      return std::nullopt;
     }
-  } catch (const std::exception&) {
-    return std::nullopt;  // 仿真器重启等情况，绝不让异常冲出主循环
-  }
-
-  // 阶段二：取快照；没有可用输入就返回 nullopt。
-  if (!pending_image_ || !latest_image_ || !latest_feedback_) {
-    ++null_;
-    return std::nullopt;
-  }
-  // 把 shared_ptr 转移出去，省掉一次引用计数的"加一减一"。
-  // 转移后 latest_image_ 变成空指针——所以下一轮 latest_image_ 为空时，条件 200 不成立，不会重复交付同一帧。
-  sensor_msgs::msg::Image::ConstSharedPtr image = std::move(latest_image_);
-  hnurm_interfaces::msg::VisionRecvData::ConstSharedPtr feedback = latest_feedback_;    // 这里不加 std::move，因为反馈要一直留着复用
-  pending_image_ = false;  // 同一图像只交给算法一次
+    image = std::move(latest_image_);       // 转移引用计数，避免重复交付同一帧
+    feedback = latest_feedback_;            // 反馈要一直留着复用，不 move
+    pending_image_ = false;  // 同一图像只交给算法一次
+  }   // lk 作用域结束
   const double stale_limit = stale_ms();
 
   // 阶段三：过期检查。
@@ -235,7 +252,9 @@ std::optional<SensorData> IoContext::read() {
   }
 
   data.timestamp = to_steady_clock(image->header.stamp);
-  data.imu_q = quat_from_rpy_deg(feedback->roll, feedback->pitch, feedback->yaw);
+  // 时间对齐：用"图像拍摄时刻"的云台姿态，而不是"现在最新的"姿态
+  const FeedbackSample att = feedback_at(data.timestamp);
+  data.imu_q = quat_from_rpy_deg(att.roll, att.pitch, att.yaw);
   data.bullet_speed = static_cast<double>(feedback->bullet_speed.data);  // 嵌套消息要取 .data
   ++ok_;  // 在四个字段都填好之后才计数——前面任何一条失败路径都走不到这里，所以 ok_ 精确表示"成功交付了多少帧"。
 
@@ -256,6 +275,36 @@ std::optional<SensorData> IoContext::read() {
 // ---------------------------------------------------------------- Write
 
 void IoContext::write(const Command& command) {
+  std::lock_guard<std::mutex> lk(cmd_mu_);
+  cmd_latest_ = command;          // ★ 只更新"最新指令"，真正发布交给 2 kHz 线程
+}
+
+// 执行器常驻线程：只负责 spin，让 ROS 回调持续推进（与 read()/控制线程解耦）
+void IoContext::run_loop() {
+  while (run_.load()) {
+    try {
+      executor_->spin_some(std::chrono::milliseconds(2));
+    } catch (const std::exception&) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+}
+
+void IoContext::publish_loop() {
+  while (pub_run_.load()) {
+    Command c{};
+    if (aim_fn) {
+      c = aim_fn();               // 高频重算瞄准（主循环只提供"最新观测"）
+    } else {
+      std::lock_guard<std::mutex> lk(cmd_mu_);
+      c = cmd_latest_;
+    }
+    publish_now(c);
+    std::this_thread::sleep_for(std::chrono::microseconds(500));
+  }
+}
+
+void IoContext::publish_now(const Command& command) {
   if (!opened_ || !command_pub_) return;
 
   hnurm_interfaces::msg::VisionSendData msg{};    // 值初始化——把所有字段清零
@@ -298,7 +347,12 @@ void IoContext::write(const Command& command) {
 void IoContext::close() {
   if (!opened_) return;
 
-  write(Command{});  // 先让云台停下
+  { std::lock_guard<std::mutex> lk(cmd_mu_); cmd_latest_ = Command{}; }   // 先让云台停下
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  pub_run_.store(false);
+  if (pub_thread_.joinable()) pub_thread_.join();
+  run_.store(false);
+  if (runner_.joinable()) runner_.join();
   std::this_thread::sleep_for(std::chrono::milliseconds(kCloseFlushMs));    // 异步处理，发完等100ms，确保真正发出去
 
   if (executor_ && node_) {
@@ -332,6 +386,38 @@ void IoContext::close() {
   std::fflush(stdout);
 
   opened_ = false;
+}
+
+IoContext::FeedbackSample IoContext::feedback_at(TimePoint t) const {
+  std::lock_guard<std::mutex> lk(data_mu_);
+  if (feedback_hist_.empty()) {
+    FeedbackSample s;
+    if (latest_feedback_) {                       // 兜底：还没有历史就用最新一条
+      s.roll  = static_cast<double>(latest_feedback_->roll);
+      s.pitch = static_cast<double>(latest_feedback_->pitch);
+      s.yaw   = static_cast<double>(latest_feedback_->yaw);
+      s.bullet_speed = static_cast<double>(latest_feedback_->bullet_speed.data);
+    }
+    return s;
+  }
+  if (t <= feedback_hist_.front().t) return feedback_hist_.front();
+  if (t >= feedback_hist_.back().t)  return feedback_hist_.back();
+  for (size_t i = 1; i < feedback_hist_.size(); ++i) {
+    const auto& b = feedback_hist_[i];
+    const auto& a = feedback_hist_[i - 1];
+    if (t <= b.t) {
+      const double span = std::chrono::duration<double>(b.t - a.t).count();
+      const double w = span > 1e-9 ? std::chrono::duration<double>(t - a.t).count() / span : 1.0;
+      FeedbackSample s;
+      s.t = t;
+      s.roll  = a.roll  + w * (b.roll  - a.roll);
+      s.pitch = a.pitch + w * (b.pitch - a.pitch);
+      s.yaw   = a.yaw   + w * (b.yaw   - a.yaw);
+      s.bullet_speed = a.bullet_speed + w * (b.bullet_speed - a.bullet_speed);
+      return s;
+    }
+  }
+  return feedback_hist_.back();
 }
 
 }  // namespace training::io

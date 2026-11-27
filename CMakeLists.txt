@@ -45,9 +45,14 @@ target_link_libraries(training_io Eigen3::Eigen yaml-cpp ${OpenCV_LIBS})
 ament_target_dependencies(training_io rclcpp sensor_msgs hnurm_interfaces)
 target_compile_options(training_io PRIVATE -Wall -Wextra -Wpedantic)
 
+
 add_library(training_lessons lessons/lesson02_io.cpp
  lessons/lesson03_detection.cpp lessons/lesson04_tracking.cpp
- lessons/lesson05_aiming.cpp)
+ lessons/lesson05_aiming.cpp lessons/lesson06_estimator.cpp
+ lessons/rm_detector.cpp lessons/rm_io.cpp
+ lessons/rm_lightbar.cpp lessons/rm_viz.cpp)
+ 
+target_include_directories(training_lessons PUBLIC "${CMAKE_SOURCE_DIR}/include/rm_aim")
 target_link_libraries(training_lessons PUBLIC training_io)
 target_include_directories(training_lessons PUBLIC "${ONNXRUNTIME_ROOT}/include")
 target_link_libraries(training_lessons PUBLIC "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so")

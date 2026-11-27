@@ -16,8 +16,14 @@
 #include <numeric>
 #include <string>
 #include <vector>
+#include <optional>
 
 namespace training {
+
+std::vector<Armor> detect_full(const cv::Mat& image);   // 第三讲正文实现（定义在本文件后部）
+
+bool g_suppress_window = false;
+
 // 第三讲：装甲板检测
 // 输入：不可修改的 CV_8UC3 BGR 图像。
 // 输出：Armor 列表；角点顺序为左上、右上、右下、左下，单位为像素。
@@ -571,7 +577,7 @@ class PatternCls {
 }  // namespace
 
 // ── 对外接口 ──────────────────────────────────────────────────────────
-std::vector<Armor> lesson03_detection(const cv::Mat& image) {
+std::vector<Armor> detect_full(const cv::Mat& image) {
   std::vector<Armor> armors;
 
 
@@ -584,7 +590,7 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
   }
   std::vector<Armor> rejected_dbg;      // 仅用于调试显示
   auto show = [&](const std::vector<Armor>& a) {
-    if (!display_env) return;
+    if (!display_env || g_suppress_window) return;
     static cv::Mat canvas;
     if (image.empty()) return;
     image.copyTo(canvas);
@@ -873,6 +879,110 @@ std::vector<Armor> lesson03_detection(const cv::Mat& image) {
   // ⑤ 调试可视化（始终开窗，0 检出也显示原图）
   show(armors);
   return armors;
+}
+
+// ============================================================================
+// 第三讲补充：ROI 二次检测（小窗口优先 → 全图回退）
+// "以上一帧锁定的位置为中心裁一小块，再送进同一个网络"：
+// · 等效放大：512×384 的裁片缩到 768×768 ⇒ 放大 1.5~2 倍，小板变"大板"；
+// · 更省算力：网络输入固定 768×768，但只用一块 512×384 的图去算，前后处理都更轻。
+//
+// 代价与对策：
+//   ① 裁错窗口 → 裁片里什么都没有 ⇒ 裁片无结果时必须立刻回退全图；
+//   ② 目标瞬移/换靶 → 连续依赖先验会锁死在旧位置 ⇒ 每 kFullEvery 帧强制一次全图；
+//   ③ 坐标必须回到原图：裁片里的 (px,py) 实际是原图的 (px+x0, py+y0)，否则 PnP/角度全错。
+// ============================================================================
+
+namespace {
+
+// ── 裁窗来源：上一帧锁定的装甲板 ───
+struct RoiGate {
+  // 可调参数
+  static constexpr int kWidth = 512;              // 裁片宽（原图像素）
+  static constexpr int kHeight = 384;             // 裁片高
+  static constexpr int kFullEvery = 4;            // 每 N 帧强制一次全图（防止跟丢）
+  static constexpr float kMinLockWidthPx = 8.0f;  // 太窄的框不值得当锚点
+
+  cv::Point2f lock{};        // 上次锁定的板心（原图像素）
+  bool has_lock = false;     // 有没有锁定过
+  int frame_no = 0;          // 帧计数
+
+  // 本帧要不要裁？返回 std::nullopt 表示"这一帧走全图"。
+  std::optional<cv::Rect> next(const cv::Size& full) {
+    ++frame_no;
+    if (!has_lock || full.width <= 0 || full.height <= 0) return std::nullopt;
+    if (kFullEvery > 1 && frame_no % kFullEvery == 0) return std::nullopt;   // 定期回退
+    const int w = std::min(full.width, std::max(128, kWidth));
+    const int h = std::min(full.height, std::max(128, kHeight));
+    int x0 = static_cast<int>(std::lround(lock.x - w * 0.5f));
+    int y0 = static_cast<int>(std::lround(lock.y - h * 0.5f));
+    x0 = std::clamp(x0, 0, full.width - w);
+    y0 = std::clamp(y0, 0, full.height - h);
+    return cv::Rect(x0, y0, w, h);
+  }
+
+  // 用本帧检测结果更新锚点：取"最宽、且不是基地/前哨站"的那块。
+  // 为什么按宽度取？框宽 ∝ 1/距离，最宽的通常就是最近、最值得打的那辆。
+  void update(const std::vector<Armor>& armors) {
+    float best = kMinLockWidthPx;
+    for (const auto& a : armors) {
+      if (is_large_class(a.class_id)) continue;   // {5,6,12,13} 基地/前哨站不是自瞄目标
+      const float w = static_cast<float>(cv::norm(a.corners[1] - a.corners[0]));
+      if (w > best) {
+        best = w;
+        lock = (a.corners[0] + a.corners[1] + a.corners[2] + a.corners[3]) * 0.25f;
+        has_lock = true;
+      }
+    }
+  }
+};
+
+// 把裁片上的结果搬回原图坐标系（漏了这一步，云台会朝左上角飞）
+inline void shift_armors(std::vector<Armor>& armors, const cv::Point& offset) {
+  for (auto& a : armors)
+    for (auto& p : a.corners) {
+      p.x += static_cast<float>(offset.x);
+      p.y += static_cast<float>(offset.y);
+    }
+}
+
+}  // namespace
+
+// 输入/输出约定与第三讲正文一致（角点顺序 左上→右上→右下→左下，单位像素）。
+std::vector<Armor> lesson03_detection(const cv::Mat& image) {
+  static RoiGate gate;                       // 跨帧状态：单线程主循环使用
+
+  if (image.empty()) return detect_full(image);
+
+  const cv::Rect roi = gate.next(image.size()).value_or(cv::Rect{});
+  if (roi.width <= 0) {                      // 本帧走全图
+    std::vector<Armor> out = detect_full(image);
+    gate.update(out);
+    return out;
+  }
+
+  // ① 先看小窗口（等效放大）：这一趟**不画窗口**（否则窗口尺寸在裁片/全图之间跳，会闪）
+  g_suppress_window = true;
+  std::vector<Armor> out = detect_full(image(roi));
+  g_suppress_window = false;
+  bool drew_full = false;
+  if (out.empty()) {                         // ② 小窗口没结果 → 立刻回退全图（逃生通道）
+    out = detect_full(image);                //    这趟会正常画窗口（尺寸=原图，固定）
+    drew_full = true;
+  } else {
+    shift_armors(out, roi.tl());             // ③ 坐标搬回原图
+  }
+  gate.update(out);
+
+  // ④ ROI 成功那几帧不会走到全图绘制 → 这里补一次"固定尺寸全图"的显示，保证窗口不闪
+  if (!drew_full && std::getenv("DISPLAY") && !image.empty()) {
+    static cv::Mat canvas;
+    image.copyTo(canvas);                    // 尺寸恒为原图 1440×1080
+    draw_debug(canvas, out);
+    cv::imshow("lesson03 armor", canvas);
+    cv::waitKey(1);
+  }
+  return out;
 }
 
 }  // namespace training

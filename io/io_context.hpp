@@ -8,6 +8,12 @@
 #include <rclcpp/executors/single_threaded_executor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <deque>
+#include <functional>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
 
 #include <cstdint>
 #include <optional>
@@ -27,6 +33,21 @@ struct IoContext {
   std::optional<SensorData> read();
   void write(const Command& command);
   void close();
+
+  // ---- 时间对齐用：带时间戳的反馈历史（只保留最近 1 s）----
+  struct FeedbackSample {
+    TimePoint t{};
+    double roll = 0, pitch = 0, yaw = 0, bullet_speed = 0;
+  };
+  // 取"目标时刻 t 的云台姿态"：在历史里线性插值；超出范围就取最近端点
+  FeedbackSample feedback_at(TimePoint t) const;
+
+  FeedbackSample last_feedback() const { return feedback_at(Clock::now()); }
+
+  // ★ 控制回调：由 2 kHz 发布线程调用，返回"此刻该发的指令"。
+  //   主循环只负责把最新一帧的检测结果放好（~50 Hz），真正的瞄准/门控在这里高频重算。
+  std::function<Command()> aim_fn;
+  void publish_now(const Command& command);   // 立即发一条（内部使用）
 
  private:
   // 辅助函数
@@ -55,6 +76,19 @@ struct IoContext {
   // ---- 跨帧状态：回调写，read()/write() 读 ----
   sensor_msgs::msg::Image::ConstSharedPtr latest_image_;                   // 最新一帧图像
   hnurm_interfaces::msg::VisionRecvData::ConstSharedPtr latest_feedback_;  // 最新一条云台反馈
+  mutable std::deque<FeedbackSample> feedback_hist_;   // 回调写、read() 读
+  // ---- 执行器常驻线程：回调不再依赖 read() 里 spin（第二线程/发布线程才不会把回调饿死）----
+  std::thread runner_;
+  std::atomic<bool> run_{false};
+  void run_loop();
+  mutable std::mutex data_mu_;              // 保护 latest_image_/latest_feedback_/feedback_hist_/pending_image_
+  std::condition_variable data_cv_;         // on_image 唤醒 read()
+  // ---- 2 kHz 发布线程（50 Hz 主循环 → 高频发布，火控门控才跟得上）----
+  std::thread pub_thread_;
+  std::mutex cmd_mu_;
+  Command cmd_latest_{};
+  std::atomic<bool> pub_run_{false};
+  void publish_loop();
   bool pending_image_ = false;  // 有一帧还没交给算法
   bool has_work_mode_ = false;  // 是否收到过工作模式
   std::uint8_t work_mode_ = 0;  // 最近一次的工作模式
